@@ -1,0 +1,9 @@
+{
+  "name": "github-dev-env",
+  "issuer": "https://token.actions.githubusercontent.com",
+  "subject": "repo:Madhan1417/white-horse:environment:dev",
+  "description": "GitHub Actions dev environment",
+  "audiences": [
+    "api://AzureADTokenExchange"
+  ]
+}
