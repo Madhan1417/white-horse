@@ -1,0 +1,501 @@
+name: Branch Preview Environment
+
+# Preview environments created per branch on push — no PR required
+# - Triggered by push to feature/** and bugfix/** branches
+# - Concurrency cancels in-progress runs for the same branch (newest wins)
+# - Cleanup triggered automatically on branch deletion
+# - Each branch gets its own ephemeral container apps
+# - Auto-scales to zero when idle to minimise costs
+
+on:
+  push:
+    branches:
+      - 'feature/**'
+      - 'bugfix/**'
+    paths-ignore:
+      - 'docs/**'
+      - '**/README.md'
+      - '**/*.md'
+
+  create: {}
+
+  delete: {}
+
+  # Allow manual trigger for testing a specific branch
+  workflow_dispatch:
+    inputs:
+      branch:
+        description: 'Branch to deploy preview for'
+        required: false
+        type: string
+
+# Cancel in-progress runs for the same branch — newest push wins
+concurrency:
+  group: preview-${{ github.ref }}
+  cancel-in-progress: true
+
+# OIDC permissions for Azure authentication
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  AZURE_CONTAINER_REGISTRY: mondayacr3366
+  BACKEND_IMAGE: backimage
+  FRONTEND_IMAGE: frontimage
+  # Previews share the dev Container App Environment but have isolated container apps
+  RESOURCE_GROUP: monday-RG
+  CONTAINER_APP_ENVIRONMENT: monday-env
+
+jobs:
+
+  # ============================================================================
+  # Deploy Preview Environment (isolated from dev)
+  # ============================================================================
+  deploy-preview:
+    if: github.event_name != 'delete' && !(github.event_name == 'create' && github.ref_type == 'tag')
+    runs-on: ubuntu-latest
+    environment: dev
+
+    outputs:
+      frontend_url: ${{ steps.deploy-frontend.outputs.url }}
+      backend_url: ${{ steps.deploy-backend.outputs.url }}
+      branch_slug: ${{ steps.names.outputs.branch_slug }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Azure Login (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Update containerapp CLI extension
+        run: |
+          az version
+          az extension update --name containerapp 2>/dev/null || az extension add --name containerapp
+          az extension show --name containerapp --query version -o tsv
+
+      - name: Login to ACR
+        run: az acr login --name ${{ env.AZURE_CONTAINER_REGISTRY }}
+
+      - name: Get ACR Login Server
+        id: acr
+        run: |
+          LOGIN_SERVER=$(az acr show --name ${{ env.AZURE_CONTAINER_REGISTRY }} --query loginServer -o tsv)
+          echo "server=$LOGIN_SERVER" >> $GITHUB_OUTPUT
+
+      # ------------------------------------------------------------
+      # NAME GENERATION (branch → container app name)
+      # ------------------------------------------------------------
+      - name: Set Preview Names
+        id: names
+        run: |
+          # Determine source branch
+          if [ "${{ github.event_name }}" == "workflow_dispatch" ] && [ -n "${{ github.event.inputs.branch }}" ]; then
+            BRANCH="${{ github.event.inputs.branch }}"
+          else
+            BRANCH="${{ github.ref_name }}"
+          fi
+
+          # Sanitise branch name: lowercase, replace non-alphanumeric with hyphens, trim to 15 chars
+          # Append 4-char hash of full branch name to prevent collisions between similar branch names
+          BRANCH_LOWER=$(echo "$BRANCH" | tr '[:upper:]' '[:lower:]')
+          HASH=$(echo -n "$BRANCH_LOWER" | sha256sum | cut -c1-4)
+          SLUG=$(echo "$BRANCH_LOWER" \
+            | sed 's/[^a-z0-9]/-/g' \
+            | sed 's/-\+/-/g' \
+            | sed 's/^-\|-$//g' \
+            | cut -c1-15 \
+            | sed 's/-$//')
+
+          # Container app names: aca-p-{slug}-{hash}-back/front
+          # Max: aca-p-(15)-(4)-front = 6+15+1+4+6 = 32 chars (within Azure limit)
+          BACKEND_APP="aca-p-${SLUG}-${HASH}-back"
+          FRONTEND_APP="aca-p-${SLUG}-${HASH}-front"
+          IMAGE_TAG="prev-${SLUG}-${HASH}-$(echo ${{ github.sha }} | cut -c1-7)"
+
+          echo "branch_slug=${SLUG}-${HASH}" >> $GITHUB_OUTPUT
+          echo "backend_app=$BACKEND_APP" >> $GITHUB_OUTPUT
+          echo "frontend_app=$FRONTEND_APP" >> $GITHUB_OUTPUT
+          echo "image_tag=$IMAGE_TAG" >> $GITHUB_OUTPUT
+          echo "branch=$BRANCH" >> $GITHUB_OUTPUT
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      # ------------------------------------------------------------
+      # GET ACR CREDENTIALS
+      # ------------------------------------------------------------
+      - name: Get ACR Credentials
+        id: acr-creds
+        run: |
+          ACR_USER=$(az acr credential show --name ${{ env.AZURE_CONTAINER_REGISTRY }} --query username -o tsv)
+          ACR_PASS=$(az acr credential show --name ${{ env.AZURE_CONTAINER_REGISTRY }} --query passwords[0].value -o tsv)
+          echo "::add-mask::$ACR_PASS"
+          echo "acr_user=$ACR_USER" >> $GITHUB_OUTPUT
+          echo "acr_pass=$ACR_PASS" >> $GITHUB_OUTPUT
+
+      # ------------------------------------------------------------
+      # BUILD BACKEND
+      # ------------------------------------------------------------
+      - name: Build and Push Backend Image
+        uses: docker/build-push-action@v6
+        with:
+          context: ./Backend
+          file: ./Backend/Dockerfile
+          push: true
+          tags: ${{ steps.acr.outputs.server }}/${{ env.BACKEND_IMAGE }}:${{ steps.names.outputs.image_tag }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # ------------------------------------------------------------
+      # DEPLOY BACKEND
+      # ------------------------------------------------------------
+      - name: Deploy Backend Preview
+        id: deploy-backend
+        run: |
+          BACKEND_APP="${{ steps.names.outputs.backend_app }}"
+          FRONTEND_APP="${{ steps.names.outputs.frontend_app }}"
+          IMAGE="${{ steps.acr.outputs.server }}/${{ env.BACKEND_IMAGE }}:${{ steps.names.outputs.image_tag }}"
+
+          # Derive FQDNs from the Container App Environment's default domain.
+          # This is available before either app is created, so FRONTEND_URL is correct
+          # in the CORS allowed origins from the very first deploy.
+          ENV_DOMAIN=$(az containerapp env show \
+            --name ${{ env.CONTAINER_APP_ENVIRONMENT }} \
+            --resource-group ${{ env.RESOURCE_GROUP }} \
+            --query "properties.defaultDomain" -o tsv)
+          BACKEND_FQDN="${BACKEND_APP}.${ENV_DOMAIN}"
+          FRONTEND_FQDN="${FRONTEND_APP}.${ENV_DOMAIN}"
+          echo "Backend FQDN:  https://$BACKEND_FQDN"
+          echo "Frontend FQDN: https://$FRONTEND_FQDN"
+
+          # Check if container app already exists
+          EXISTS=$(az containerapp show \
+            --name $BACKEND_APP \
+            --resource-group ${{ env.RESOURCE_GROUP }} \
+            --query "name" -o tsv 2>/dev/null || echo "")
+
+          if [ -z "$EXISTS" ]; then
+            echo "Creating new preview backend container app..."
+            az containerapp create \
+              --name $BACKEND_APP \
+              --resource-group ${{ env.RESOURCE_GROUP }} \
+              --environment ${{ env.CONTAINER_APP_ENVIRONMENT }} \
+              --image $IMAGE \
+              --target-port 4000 \
+              --ingress external \
+              --min-replicas 0 \
+              --max-replicas 1 \
+              --cpu 0.5 \
+              --memory 1.0Gi \
+              --system-assigned \
+              --registry-server ${{ steps.acr.outputs.server }} \
+              --registry-username ${{ steps.acr-creds.outputs.acr_user }} \
+              --registry-password ${{ steps.acr-creds.outputs.acr_pass }} \
+              --no-wait
+
+            # Poll revision health instead of provisioningState.
+            # With min-replicas=0, provisioningState stays InProgress indefinitely
+            # because Azure never gets a running replica to finalise the ARM operation.
+            echo "Polling revision health..."
+            for i in $(seq 1 90); do
+              REVISION=$(az containerapp show \
+                --name $BACKEND_APP \
+                --resource-group ${{ env.RESOURCE_GROUP }} \
+                --query "properties.latestRevisionName" -o tsv 2>/dev/null || echo "")
+              HEALTH=$(az containerapp revision show \
+                --name $BACKEND_APP \
+                --resource-group ${{ env.RESOURCE_GROUP }} \
+                --revision "$REVISION" \
+                --query "properties.healthState" -o tsv 2>/dev/null || echo "Unknown")
+              RSTATE=$(az containerapp revision show \
+                --name $BACKEND_APP \
+                --resource-group ${{ env.RESOURCE_GROUP }} \
+                --revision "$REVISION" \
+                --query "properties.runningState" -o tsv 2>/dev/null || echo "Unknown")
+              echo "  [$i/90] revision: $REVISION | healthState: $HEALTH | runningState: $RSTATE"
+              [ "$HEALTH" = "Healthy" ] && break
+              [ "$RSTATE" = "ActivationFailed" ] && echo "ERROR: Revision activation failed" && exit 1
+              [ "$HEALTH" = "Unhealthy" ]       && echo "ERROR: Revision unhealthy"           && exit 1
+              sleep 10
+            done
+          else
+            echo "Updating existing preview backend container app..."
+            az containerapp update \
+              --name $BACKEND_APP \
+              --resource-group ${{ env.RESOURCE_GROUP }} \
+              --image $IMAGE \
+              --no-wait
+          fi
+
+          # Wait for any in-progress operation to clear before updating env-vars
+          echo "Waiting for container app provisioning to settle..."
+          for i in $(seq 1 30); do
+            STATE=$(az containerapp show \
+              --name $BACKEND_APP \
+              --resource-group ${{ env.RESOURCE_GROUP }} \
+              --query "properties.provisioningState" -o tsv 2>/dev/null || echo "Unknown")
+            echo "  [$i/30] provisioningState: $STATE"
+            [ "$STATE" = "Succeeded" ] || [ "$STATE" = "Failed" ] && break
+            sleep 10
+          done
+
+          # Always sync env-vars (covers both create and update paths)
+          az containerapp update \
+            --name $BACKEND_APP \
+            --resource-group ${{ env.RESOURCE_GROUP }} \
+            --set-env-vars \
+              "FRONTEND_URL=https://${FRONTEND_FQDN}" \
+              "PORT=4000" \
+              "NODE_ENV=preview" \
+            --no-wait
+
+          echo "url=https://$BACKEND_FQDN" >> $GITHUB_OUTPUT
+          echo "frontend_url=https://$FRONTEND_FQDN" >> $GITHUB_OUTPUT
+
+      # ------------------------------------------------------------
+      # BUILD FRONTEND
+      # ------------------------------------------------------------
+      - name: Build and Push Frontend Image
+        uses: docker/build-push-action@v6
+        with:
+          context: ./Frontend
+          file: ./Frontend/Dockerfile
+          push: true
+          tags: ${{ steps.acr.outputs.server }}/${{ env.FRONTEND_IMAGE }}:${{ steps.names.outputs.image_tag }}
+          build-args: |
+            NEXT_PUBLIC_API_URL=${{ steps.deploy-backend.outputs.url }}/api
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # ------------------------------------------------------------
+      # DEPLOY FRONTEND
+      # ------------------------------------------------------------
+      - name: Deploy Frontend Preview
+        id: deploy-frontend
+        run: |
+          FRONTEND_APP="${{ steps.names.outputs.frontend_app }}"
+          IMAGE="${{ steps.acr.outputs.server }}/${{ env.FRONTEND_IMAGE }}:${{ steps.names.outputs.image_tag }}"
+
+          ENV_DOMAIN=$(az containerapp env show \
+            --name ${{ env.CONTAINER_APP_ENVIRONMENT }} \
+            --resource-group ${{ env.RESOURCE_GROUP }} \
+            --query "properties.defaultDomain" -o tsv)
+          FRONTEND_FQDN="${FRONTEND_APP}.${ENV_DOMAIN}"
+
+          # Check if container app already exists
+          EXISTS=$(az containerapp show \
+            --name $FRONTEND_APP \
+            --resource-group ${{ env.RESOURCE_GROUP }} \
+            --query "name" -o tsv 2>/dev/null || echo "")
+
+          if [ -z "$EXISTS" ]; then
+            echo "Creating new preview frontend container app..."
+            az containerapp create \
+              --name $FRONTEND_APP \
+              --resource-group ${{ env.RESOURCE_GROUP }} \
+              --environment ${{ env.CONTAINER_APP_ENVIRONMENT }} \
+              --image $IMAGE \
+              --target-port 3000 \
+              --ingress external \
+              --min-replicas 0 \
+              --max-replicas 1 \
+              --cpu 0.5 \
+              --memory 1.0Gi \
+              --system-assigned \
+              --registry-server ${{ steps.acr.outputs.server }} \
+              --registry-username ${{ steps.acr-creds.outputs.acr_user }} \
+              --registry-password ${{ steps.acr-creds.outputs.acr_pass }} \
+              --no-wait
+
+            echo "Polling revision health..."
+            for i in $(seq 1 90); do
+              REVISION=$(az containerapp show \
+                --name $FRONTEND_APP \
+                --resource-group ${{ env.RESOURCE_GROUP }} \
+                --query "properties.latestRevisionName" -o tsv 2>/dev/null || echo "")
+              HEALTH=$(az containerapp revision show \
+                --name $FRONTEND_APP \
+                --resource-group ${{ env.RESOURCE_GROUP }} \
+                --revision "$REVISION" \
+                --query "properties.healthState" -o tsv 2>/dev/null || echo "Unknown")
+              RSTATE=$(az containerapp revision show \
+                --name $FRONTEND_APP \
+                --resource-group ${{ env.RESOURCE_GROUP }} \
+                --revision "$REVISION" \
+                --query "properties.runningState" -o tsv 2>/dev/null || echo "Unknown")
+              echo "  [$i/90] revision: $REVISION | healthState: $HEALTH | runningState: $RSTATE"
+              [ "$HEALTH" = "Healthy" ] && break
+              [ "$RSTATE" = "ActivationFailed" ] && echo "ERROR: Revision activation failed" && exit 1
+              [ "$HEALTH" = "Unhealthy" ]       && echo "ERROR: Revision unhealthy"           && exit 1
+              sleep 10
+            done
+          else
+            echo "Updating existing preview frontend container app..."
+            az containerapp update \
+              --name $FRONTEND_APP \
+              --resource-group ${{ env.RESOURCE_GROUP }} \
+              --image $IMAGE \
+              --no-wait
+          fi
+
+          echo "url=https://$FRONTEND_FQDN" >> $GITHUB_OUTPUT
+
+      # ------------------------------------------------------------
+      # POST-DEPLOY HARDENING
+      # ------------------------------------------------------------
+      - name: Force HTTPS
+        run: |
+          az containerapp ingress update \
+            --name ${{ steps.names.outputs.backend_app }} \
+            --resource-group ${{ env.RESOURCE_GROUP }} \
+            --allow-insecure false
+
+          az containerapp ingress update \
+            --name ${{ steps.names.outputs.frontend_app }} \
+            --resource-group ${{ env.RESOURCE_GROUP }} \
+            --allow-insecure false
+
+      - name: Verify Deployments
+        run: |
+          echo "Waiting 30 s for containers to warm up..."
+          sleep 30
+
+          BACKEND_URL="${{ steps.deploy-backend.outputs.url }}/healthz"
+          echo "Checking backend: $BACKEND_URL"
+          for i in {1..6}; do
+            RESPONSE=$(curl -s -o /dev/null -w "%{http_code}" "$BACKEND_URL" 2>/dev/null || echo "000")
+            [ "$RESPONSE" = "200" ] && echo "✅ Backend healthy" && break
+            echo "  Attempt $i: got $RESPONSE, retrying in 10 s..."
+            sleep 10
+          done
+          [ "$RESPONSE" != "200" ] && echo "⚠️  Backend not yet healthy (may still be cold-starting)"
+
+          FRONTEND_URL="${{ steps.deploy-frontend.outputs.url }}/healthz"
+          echo "Checking frontend: $FRONTEND_URL"
+          for i in {1..6}; do
+            RESPONSE=$(curl -s -o /dev/null -w "%{http_code}" "$FRONTEND_URL" 2>/dev/null || echo "000")
+            [ "$RESPONSE" = "200" ] && echo "✅ Frontend healthy" && break
+            echo "  Attempt $i: got $RESPONSE, retrying in 10 s..."
+            sleep 10
+          done
+          [ "$RESPONSE" != "200" ] && echo "⚠️  Frontend not yet healthy (may still be cold-starting)"
+
+  # ============================================================================
+  # Post Preview URL to Job Summary
+  # ============================================================================
+  post-summary:
+    needs: deploy-preview
+    if: github.event_name != 'delete'
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Write Job Summary
+        run: |
+          echo "## 🚀 Preview Environment Deployed" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Component | URL |" >> $GITHUB_STEP_SUMMARY
+          echo "|-----------|-----|" >> $GITHUB_STEP_SUMMARY
+          echo "| **Frontend** | ${{ needs.deploy-preview.outputs.frontend_url }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Backend API** | ${{ needs.deploy-preview.outputs.backend_url }}/api |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "> ⚠️ Preview environments scale to zero when idle. First request may take ~30 s to cold start." >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "---" >> $GITHUB_STEP_SUMMARY
+          echo "<sub>Branch: \`${{ needs.deploy-preview.outputs.branch_slug }}\` • Commit: \`${{ github.sha }}\`</sub>" >> $GITHUB_STEP_SUMMARY
+
+  # ============================================================================
+  # Cleanup Preview Environment (on branch deletion)
+  # ============================================================================
+  cleanup-preview:
+    if: github.event_name == 'delete' && github.event.ref_type == 'branch'
+    runs-on: ubuntu-latest
+    environment: dev
+
+    steps:
+      - name: Azure Login (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Update containerapp CLI extension
+        run: |
+          az extension update --name containerapp 2>/dev/null || az extension add --name containerapp
+
+      # Recompute the exact same names used during deploy so we delete the right apps
+      - name: Set Preview Names
+        id: names
+        run: |
+          BRANCH="${{ github.event.ref }}"
+          BRANCH_LOWER=$(echo "$BRANCH" | tr '[:upper:]' '[:lower:]')
+          HASH=$(echo -n "$BRANCH_LOWER" | sha256sum | cut -c1-4)
+          SLUG=$(echo "$BRANCH_LOWER" \
+            | sed 's/[^a-z0-9]/-/g' \
+            | sed 's/-\+/-/g' \
+            | sed 's/^-\|-$//g' \
+            | cut -c1-15 \
+            | sed 's/-$//')
+          echo "backend_app=aca-p-${SLUG}-${HASH}-back"   >> $GITHUB_OUTPUT
+          echo "frontend_app=aca-p-${SLUG}-${HASH}-front" >> $GITHUB_OUTPUT
+          echo "branch_slug=${SLUG}-${HASH}"               >> $GITHUB_OUTPUT
+
+      - name: Delete Preview Container Apps
+        run: |
+          echo "Deleting backend container app: ${{ steps.names.outputs.backend_app }}"
+          az containerapp delete \
+            --name ${{ steps.names.outputs.backend_app }} \
+            --resource-group ${{ env.RESOURCE_GROUP }} \
+            --yes 2>/dev/null \
+            || echo "Backend app already deleted or not found — skipping"
+
+          echo "Deleting frontend container app: ${{ steps.names.outputs.frontend_app }}"
+          az containerapp delete \
+            --name ${{ steps.names.outputs.frontend_app }} \
+            --resource-group ${{ env.RESOURCE_GROUP }} \
+            --yes 2>/dev/null \
+            || echo "Frontend app already deleted or not found — skipping"
+
+      - name: Delete Preview ACR Images
+        run: |
+          SLUG="${{ steps.names.outputs.branch_slug }}"
+          echo "Removing ACR image tags matching: prev-${SLUG}-*"
+
+          for REPO in ${{ env.BACKEND_IMAGE }} ${{ env.FRONTEND_IMAGE }}; do
+            TAGS=$(az acr repository show-tags \
+              --name ${{ env.AZURE_CONTAINER_REGISTRY }} \
+              --repository "$REPO" \
+              --query "[?starts_with(@, 'prev-${SLUG}-')]" \
+              -o tsv 2>/dev/null || echo "")
+
+            if [ -n "$TAGS" ]; then
+              for TAG in $TAGS; do
+                echo "  Deleting $REPO:$TAG"
+                az acr repository delete \
+                  --name ${{ env.AZURE_CONTAINER_REGISTRY }} \
+                  --image "$REPO:$TAG" \
+                  --yes 2>/dev/null \
+                  || echo "  Tag $TAG not found — skipping"
+              done
+            else
+              echo "  No preview images found for $REPO with prefix prev-${SLUG}-*"
+            fi
+          done
+
+      - name: Write Cleanup Summary
+        run: |
+          echo "## 🗑️ Preview Environment Destroyed" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Resource | Name |" >> $GITHUB_STEP_SUMMARY
+          echo "|----------|------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Backend container app  | \`${{ steps.names.outputs.backend_app }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| Frontend container app | \`${{ steps.names.outputs.frontend_app }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| ACR image tags removed | \`prev-${{ steps.names.outputs.branch_slug }}-*\` |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "<sub>Branch: \`${{ github.event.ref }}\` • Deleted by: \`${{ github.actor }}\`</sub>" >> $GITHUB_STEP_SUMMARY
